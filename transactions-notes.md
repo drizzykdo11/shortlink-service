@@ -1,82 +1,86 @@
-# Module 22 — Transaction Lab Notes
-
-> Status: **Expected results only; actual Workbench outputs have not yet been supplied or independently verified.** Replace `_____` with observations from both connections before submitting.
+# Module 22 — MySQL Transactions Lab
 
 ## Environment
 
-- Database: `txn_lab`
-- Engine: `InnoDB`
-- Connection A ID: `__34___`
-- Connection B ID: `__36___` (**must be different**)
-- A / B `@@autocommit`: `___1__` / `__1___` (expected `1` / `1`)
-- A initial isolation: `_REPEATABLE-READ____` (often `REPEATABLE-READ`)
-- Run the setup once. Execute individual A/B statements in the numbered order, not entire files.
+- **Database:** `txn_lab`
+- **Database server:** MySQL 8.0.46, InnoDB
+- **Client:** MySQL Workbench
+- **Independent sessions:** Connection A (ID 34) and Connection B (ID 36)
+- **Initial account balances:** Alice = 1000; Bob = 1000
+- **Isolation levels tested:** `REPEATABLE READ` and `READ COMMITTED`
 
-## 1. Atomicity
+The experiments used two independent MySQL connections. Statements in `connection A.sql` and `connection B.sql` were executed in their labeled interleaved order.
 
-| Checkpoint | Expected | Observed |
-| --- | --- | --- |
-| Before ROLLBACK, Alice | 900 | __900___ |
-| After ROLLBACK, Alice | 1000 | __1000___ |
-| After full transfer COMMIT, Alice | 900 | __900___ |
-| After full transfer COMMIT, Bob | 1100 | __1100___ |
+## 1. Atomicity: COMMIT and ROLLBACK
 
-Explanation: A transaction lets the debit and credit succeed or be rolled back together. Without a transaction, autocommit could preserve Alice's debit even if the program crashes before Bob's credit.
+The test first deducted 100 from Alice inside an explicit transaction and then issued `ROLLBACK`. The debit was not retained. A separate transfer used two updates—debiting Alice and crediting Bob—followed by `COMMIT`, so both changes could be committed together.
 
-## 2. Isolation levels
+With both accounts starting at 1000, a rolled-back debit leaves Alice at 1000. A successfully committed transfer of 100 leaves Alice at 900 and Bob at 1100. Without an explicit transaction, autocommit could preserve the debit even if the application failed before the credit.
 
-| Isolation | First SELECT | Second SELECT | After COMMIT | Actual observations |
-| --- | ---: | ---: | ---: | --- |
-| REPEATABLE READ | 1000 | 1000 | 1050 | _1000____ / _1000____ / _1050_ _ |
-| READ COMMITTED | 1000 | 1050 | 1050 | _1000____ / __1050___ / __1050___ |
+## 2. Isolation Levels
 
-**Answer 1 — In my own words (reference draft):**
+Recorded balance readings for Alice:
 
-Under REPEATABLE READ, both SELECT statements in the same transaction returned 1000, even after another transaction committed a balance of 1050. Under READ COMMITTED, the second SELECT returned 1050 because it used a newer snapshot, allowing a non-repeatable read.
+| Isolation level | First SELECT | Second SELECT (after B commits +50) | SELECT after A commits |
+| --- | ---: | ---: | ---: |
+| `REPEATABLE READ` | 1000 | 1000 | 1050 |
+| `READ COMMITTED` | 1000 | 1050 | 1050 |
 
-## 3. Lost update and solutions
+**Explanation.** Under `REPEATABLE READ`, A's ordinary consistent reads reused the same snapshot, so B's committed change was not visible until A finished its transaction. Under `READ COMMITTED`, A's second `SELECT` obtained a newer snapshot and saw B's committed update. This demonstrates that `READ COMMITTED` permits a **non-repeatable read**.
 
-| Checkpoint | Expected | Observed |
-| --- | --- | --- |
-| Both sessions' initial SELECT | 1000 / 1000 | _1000____ / __1000___ |
-| Lost-update final balance | 900 (incorrect) | __900___ |
-| Correct balance after two withdrawals | 800 | __800___ |
-| Atomic `balance = balance - 100` final | 800 | __800___ |
-| Session B `FOR UPDATE` waited? | Yes | ___Yes__ |
-| Session B `FOR UPDATE` returned | 900 | __900___ |
-| `FOR UPDATE` final balance | 800 | __800___ |
+## 3. Lost Update and Two Fixes
 
-**Answer 2 — In my own words (reference draft):**
+| Test | Recorded outcome |
+| --- | --- |
+| Two sessions read 1000 and each write the absolute value 900 | Final balance = **900**; one withdrawal was lost |
+| Both sessions use `SET balance = balance - 100` | Final balance = **800** |
+| B executes `SELECT ... FOR UPDATE` while A holds the lock | **B waited** |
+| B's locking read continues after A commits its deduction | B reads **900** |
+| B then deducts 100 and commits | Final balance = **800** |
 
-`SET balance = balance - 100` avoids lost updates because InnoDB coordinates concurrent modifications using row locks and applies each subtraction to the current value. I would use `SELECT ... FOR UPDATE` when the application must read data, validate complex business conditions, and then update the records safely within a transaction.
+**Explanation.** Writing a value calculated from an earlier application read can overwrite the effect of another request. A relative update such as `SET balance = balance - 100` lets InnoDB coordinate concurrent changes and calculate from the current record value. `SELECT ... FOR UPDATE` is useful when an application must first read and validate data, then make a decision and update it within the same transaction.
 
-## 4. Deadlock (bonus)
+## 4. Deadlock
 
-- Session reporting Error 1213: `__B___` (A or B; not predetermined)
-- Full error message: `_Deadlock found when trying to get to lock____`
-- Did the other session complete after the victim rolled back? `_No____`
-- After `ROLLBACK` in A and B, Alice / Bob balances: `___1000__` / `__1000___` (expected `1000` / `1000`)
+The two connections acquired locks in opposite orders:
 
-**Answer 3 — In my own words (reference draft):**
+- **A** updated Alice (`id = 1`) and then tried to update Bob (`id = 2`).
+- **B** updated Bob (`id = 2`) and then tried to update Alice (`id = 1`).
 
-A deadlock occurs when two transactions hold locks that the other transaction needs, causing a circular wait. Keeping transactions short and acquiring locks in a consistent order can reduce the risk of deadlocks.
+This created a circular wait. **Connection B was reported as the deadlock victim**, with MySQL error 1213:
 
-## Troubleshooting / lessons
-
-- `Error 1213`: a deadlock was detected; InnoDB rolls back the **entire victim transaction**. The application should retry that complete transaction.
-- `Error 1205`: lock wait timeout; by default InnoDB rolls back the **failed statement only**. Explicitly end the remaining transaction in this lab.
-- Avoid using two SQL editor tabs that share one Workbench server connection; verify with `SELECT CONNECTION_ID()`.
-- Run `ROLLBACK` in both sessions after the deadlock exercise, once blocked statements have returned.
-
-## Git commit
-
-From your local `shortlink-service` directory, after checking and filling the actual results:
-
-```bash
-git status
-git add transactions.sql "connection A.sql" "connection B.sql" transactions-notes.md
-git commit -m "Complete Module 22 transaction exercises"
-git push
+```text
+Deadlock found when trying to get lock; try restarting transaction
 ```
 
-`git push` requires a configured remote and appropriate authentication. If the branch has no upstream, use `git push -u origin <your-branch-name>` after verifying the remote with `git remote -v`.
+**Observed:** After InnoDB rolled back connection B, B's lock on Bob's row (`id = 2`) was released. **Connection A's previously blocked `UPDATE ... WHERE id = 2` completed successfully.** This completed the SQL statement, but did not automatically end A's transaction; A still needed an explicit `COMMIT` or `ROLLBACK`. To discard the test changes, `ROLLBACK` should be issued for any surviving open transaction. Running `ROLLBACK` in both sessions after their statements finish is a safe lab cleanup procedure.
+
+**Explanation.** A deadlock occurs when transactions hold locks needed by one another and form a cycle of waiting. Keeping transactions short and acquiring records in a consistent order reduces the probability of deadlocks. Applications must still be prepared to retry a transaction rolled back due to error 1213.
+
+## 5. Backend Application Takeaways
+
+### Click counters
+
+A Django view that loads `link.click_count`, increments it in Python, and saves it can lose increments when many requests read the same old value. A database-side update avoids this read-modify-write race:
+
+```python
+from django.db.models import F
+
+Link.objects.filter(pk=link_id).update(click_count=F('click_count') + 1)
+```
+
+### Flash-sale inventory
+
+Stock can be decremented only when available using one conditional statement, without an explicit `SELECT ... FOR UPDATE`:
+
+```python
+updated = Product.objects.filter(pk=product_id, stock__gt=0).update(
+    stock=F('stock') - 1
+)
+```
+
+`updated == 1` indicates the stock decrement succeeded; `updated == 0` means no product matched the conditions (for example, the item was out of stock or did not exist). If order creation and inventory changes must succeed together, they also need an appropriate transaction.
+
+## Conclusion
+
+This lab demonstrated rollback and commit behavior, the snapshot differences between `REPEATABLE READ` and `READ COMMITTED`, the lost-update problem, and two safe ways to coordinate concurrent modifications. It also reproduced a deadlock: B was rolled back as the victim, and A's blocked update completed after B released its locks. The experiment illustrates why lock acquisition order and explicit transaction cleanup matter.
